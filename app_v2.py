@@ -79,7 +79,13 @@ def load_system():
 nlp, embedder, db_conn, full_icd_df = load_system()
 
 # --- Linguistic Helpers ---
-NON_CLINICAL_STOPWORDS = {"male", "female", "patient", "year-old", "man", "woman", "history", "day", "days", "week", "weeks", "month", "months", "year", "years", "doctor", "hospital", "clinic", "morning", "night", "today", "yesterday", "presents", "examination", "review", "complains", "reports", "denies", "occasional", "persistent", "old", "presents with", "underwent", "performed"}
+NON_CLINICAL_STOPWORDS = {
+    "male", "female", "patient", "year-old", "man", "woman", "history", "day", "days", 
+    "week", "weeks", "month", "months", "year", "years", "doctor", "hospital", "clinic", 
+    "morning", "night", "today", "yesterday", "presents", "examination", "review", "complains", 
+    "reports", "denies", "occasional", "persistent", "old", "presents with", "underwent", 
+    "performed", "long", "standing", "long-standing", "mild", "severe", "moderate"
+}
 NEGATION_TRIGGERS = ["no", "not", "denies", "without", "absent", "negative for", "ruled out", "free of"]
 
 def clean_entity_text(phrase):
@@ -106,28 +112,44 @@ def parse_clinical_doc(text):
                     pos_findings.append(cleaned)
     return [e for e in dict.fromkeys(pos_findings) if e not in neg_findings], list(dict.fromkeys(neg_findings)), list(dict.fromkeys(procedures))
 
-# --- Hybrid Semantic Search Across 98,505 Codes ---
-def search_hybrid_icd(query_term, top_candidates=25):
+# --- High-Precision Hybrid Semantic Search Across 98,505 Codes ---
+def search_hybrid_icd(query_term, top_candidates=35):
     cursor = db_conn.cursor()
     tokens = [re.sub(r"[^\w]", "", t) for t in query_term.split() if len(t) > 2]
     if not tokens:
         return None
-    fts_query = " OR ".join([f'"{t}"*' for t in tokens])
-    
+        
+    # 1. Exact Full Phrase Search
+    exact_phrase = f'"{query_term}"'
     try:
-        cursor.execute("SELECT icd10_code, full_description, category, chapter FROM icd10_fts WHERE icd10_fts MATCH ? LIMIT ?", (fts_query, top_candidates))
+        cursor.execute("SELECT icd10_code, full_description, category, chapter FROM icd10_fts WHERE icd10_fts MATCH ? LIMIT ?", (exact_phrase, top_candidates))
         rows = cursor.fetchall()
     except Exception:
         rows = []
         
+    # 2. Strict AND Search (all tokens must match)
     if not rows:
-        cursor.execute("SELECT icd10_code, full_description, category, chapter FROM icd10_fts WHERE full_description LIKE ? LIMIT ?", (f"%{tokens[0]}%", top_candidates))
-        rows = cursor.fetchall()
-        
+        fts_and_query = " AND ".join([f'"{t}"*' for t in tokens])
+        try:
+            cursor.execute("SELECT icd10_code, full_description, category, chapter FROM icd10_fts WHERE icd10_fts MATCH ? LIMIT ?", (fts_and_query, top_candidates))
+            rows = cursor.fetchall()
+        except Exception:
+            rows = []
+
+    # 3. Fallback OR Search
+    if not rows:
+        fts_or_query = " OR ".join([f'"{t}"*' for t in tokens])
+        try:
+            cursor.execute("SELECT icd10_code, full_description, category, chapter FROM icd10_fts WHERE icd10_fts MATCH ? LIMIT ?", (fts_or_query, top_candidates))
+            rows = cursor.fetchall()
+        except Exception:
+            rows = []
+            
     if not rows:
         return None
         
-    candidate_texts = [r[1] for r in rows]
+    # Semantic Cross-Encoder Reranking
+    candidate_texts = [f"{r[1]} {r[2]}" for r in rows]
     query_emb = embedder.encode(query_term, convert_to_tensor=True)
     cand_embs = embedder.encode(candidate_texts, convert_to_tensor=True)
     scores = util.cos_sim(query_emb, cand_embs)[0]
@@ -135,7 +157,7 @@ def search_hybrid_icd(query_term, top_candidates=25):
     best_idx = int(scores.argmax())
     best_score = float(scores[best_idx])
     best_match = rows[best_idx]
-    confidence = max(40, min(99, int(best_score * 100)))
+    confidence = max(50, min(99, int(best_score * 100)))
     
     return {
         "code": best_match[0],
