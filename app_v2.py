@@ -1,4 +1,4 @@
-﻿import streamlit as st
+import streamlit as st
 import pandas as pd
 import chromadb
 from chromadb.utils import embedding_functions
@@ -29,9 +29,20 @@ def load_system():
     nlp = spacy.load("en_core_web_sm")
     df = pd.read_csv("master_icd10_registry.csv")
     
-    client = chromadb.PersistentClient(path="./chroma_db_store")
+    # In-memory ChromaDB client for instant cloud deployment
+    client = chromadb.Client()
     emb_fn = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
-    collection = client.get_collection(name="master_icd10_persistent", embedding_function=emb_fn)
+    collection = client.get_or_create_collection(name="master_icd10_cloud", embedding_function=emb_fn)
+    
+    if collection.count() == 0:
+        ids = df["icd10_code"].astype(str).tolist()
+        documents = df["full_description"].astype(str).tolist()
+        metadatas = [
+            {"category": str(cat), "chapter": str(ch)}
+            for cat, ch in zip(df["category"], df["chapter"])
+        ]
+        collection.add(ids=ids, documents=documents, metadatas=metadatas)
+        
     return nlp, collection, df
 
 nlp, collection, icd_df = load_system()
@@ -69,12 +80,11 @@ def parse_clinical_statements(text):
                 else:
                     pos_entities.append(cleaned)
                     
-    # Remove duplicate and cross-negated entities
     clean_pos = [e for e in dict.fromkeys(pos_entities) if e not in neg_entities]
     clean_neg = list(dict.fromkeys(neg_entities))
     return clean_pos, clean_neg
 
-# Streamlit Interface Layout
+# Streamlit Interface
 st.markdown('<div class="main-title">🩺 Automated Clinical ICD-10 Coder & Billing System</div>', unsafe_allow_html=True)
 st.markdown('<div class="sub-title">Semantic Retrieval Engine with Rigorous Entity Cleaning & Negation Filtering</div>', unsafe_allow_html=True)
 
