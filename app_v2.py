@@ -29,23 +29,33 @@ def load_system():
     nlp = spacy.load("en_core_web_sm")
     df = pd.read_csv("master_icd10_registry.csv")
     
-    # In-memory ChromaDB client for instant cloud deployment
+    # Normalize column names to lowercase
+    df.columns = [c.lower().strip() for c in df.columns]
+    
+    code_col = next((c for c in ["icd10_code", "code", "icd_code", "icd10"] if c in df.columns), df.columns[0])
+    desc_col = next((c for c in ["full_description", "description", "long_description", "desc"] if c in df.columns), df.columns[1])
+    cat_col = next((c for c in ["category", "disease_category", "class"] if c in df.columns), None)
+    ch_col = next((c for c in ["chapter", "icd_chapter"] if c in df.columns), None)
+    
     client = chromadb.Client()
     emb_fn = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
-    collection = client.get_or_create_collection(name="master_icd10_cloud", embedding_function=emb_fn)
+    collection = client.get_or_create_collection(name="master_icd10_cloud_v2", embedding_function=emb_fn)
     
     if collection.count() == 0:
-        ids = df["icd10_code"].astype(str).tolist()
-        documents = df["full_description"].astype(str).tolist()
-        metadatas = [
-            {"category": str(cat), "chapter": str(ch)}
-            for cat, ch in zip(df["category"], df["chapter"])
-        ]
+        ids = df[code_col].astype(str).tolist()
+        documents = df[desc_col].astype(str).tolist()
+        
+        metadatas = []
+        for idx in range(len(df)):
+            cat = str(df[cat_col].iloc[idx]) if cat_col else "General"
+            ch = str(df[ch_col].iloc[idx]) if ch_col else "General"
+            metadatas.append({"category": cat, "chapter": ch})
+            
         collection.add(ids=ids, documents=documents, metadatas=metadatas)
         
-    return nlp, collection, df
+    return nlp, collection, df, code_col, desc_col
 
-nlp, collection, icd_df = load_system()
+nlp, collection, icd_df, code_col_name, desc_col_name = load_system()
 
 NON_CLINICAL_STOPWORDS = {
     "male", "female", "patient", "year-old", "man", "woman", "history", "day", "days", 
@@ -84,7 +94,7 @@ def parse_clinical_statements(text):
     clean_neg = list(dict.fromkeys(neg_entities))
     return clean_pos, clean_neg
 
-# Streamlit Interface
+# UI Layout
 st.markdown('<div class="main-title">🩺 Automated Clinical ICD-10 Coder & Billing System</div>', unsafe_allow_html=True)
 st.markdown('<div class="sub-title">Semantic Retrieval Engine with Rigorous Entity Cleaning & Negation Filtering</div>', unsafe_allow_html=True)
 
@@ -132,8 +142,8 @@ with col2:
                 if res["ids"] and len(res["ids"][0]) > 0:
                     code = res["ids"][0][0]
                     desc = res["documents"][0][0]
-                    category = res["metadatas"][0][0]["category"]
-                    chapter = res["metadatas"][0][0]["chapter"]
+                    category = res["metadatas"][0][0].get("category", "General")
+                    chapter = res["metadatas"][0][0].get("chapter", "General")
                     dist = res["distances"][0][0]
                     confidence = max(0, min(100, int((1 - (dist / 2)) * 100)))
                     
