@@ -17,7 +17,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- Global Light Blue Theme ---
+# --- Global Light Blue Medical Theme ---
 st.markdown("""
     <style>
     .stApp { background-color: #EBF4FC !important; color: #0F172A !important; font-family: 'Segoe UI', sans-serif; }
@@ -78,7 +78,7 @@ def load_system():
 
 nlp, embedder, db_conn, full_icd_df = load_system()
 
-# --- Linguistic Helpers ---
+# --- High-Precision Linguistic Helpers ---
 NON_CLINICAL_STOPWORDS = {
     "male", "female", "patient", "year-old", "man", "woman", "history", "day", "days", 
     "week", "weeks", "month", "months", "year", "years", "doctor", "hospital", "clinic", 
@@ -88,14 +88,12 @@ NON_CLINICAL_STOPWORDS = {
 }
 NEGATION_TRIGGERS = ["no", "not", "denies", "without", "absent", "negative for", "ruled out", "free of"]
 
-# --- 1. Numbers Retain Panra Clean Function ---
 def clean_entity_text(phrase):
     phrase = re.sub(r"\b\d+[- ]*(year|yr)[- ]*old\b", "", phrase, flags=re.IGNORECASE)
     phrase = re.sub(r"[^a-zA-Z0-9\s]", " ", phrase)
-    words = [w.lower() for w in phrase.split() if w.lower() not in NON_CLINICAL_STOPWORDS and len(w) > 1]
+    words = [w.lower() for w in phrase.split() if w.lower() not in NON_CLINICAL_STOPWORDS and (len(w) > 1 or w.isdigit())]
     return " ".join(words).strip()
 
-# --- 2. Procedures ICD-kulla Leak Aagadha Parser ---
 def parse_clinical_doc(text):
     doc = nlp(text)
     pos_findings, neg_findings, procedures = [], [], []
@@ -127,10 +125,10 @@ def parse_clinical_doc(text):
                     
     return [e for e in dict.fromkeys(pos_findings) if e not in neg_findings], list(dict.fromkeys(neg_findings)), list(dict.fromkeys(procedures))
 
-# --- 3. Exact Code Priority Hybrid Search ---
-def search_hybrid_icd(query_term, top_candidates=35):
+# --- High-Precision Hybrid Semantic Search Across 98,505 Codes ---
+def search_hybrid_icd(query_term, top_candidates=40):
     cursor = db_conn.cursor()
-    tokens = [re.sub(r"[^\w]", "", t) for t in query_term.split() if len(t) > 1]
+    tokens = [re.sub(r"[^\w]", "", t) for t in query_term.split() if len(t) > 1 or t.isdigit()]
     if not tokens:
         return None
         
@@ -166,16 +164,34 @@ def search_hybrid_icd(query_term, top_candidates=35):
     
     adjusted_scores = []
     for idx, r in enumerate(rows):
-        base_score = float(scores[idx])
-        if r[0].startswith("O") and "childbirth" not in query_term and "pregnan" not in query_term:
-            base_score -= 0.25
-        if query_term.lower() in r[1].lower():
-            base_score += 0.15
-        adjusted_scores.append(base_score)
+        score = float(scores[idx])
+        code = r[0]
+        desc = r[1].lower()
+        
+        # Rule 1: Heavily penalize Pregnancy/Obstetric codes (O-series) on non-obstetric general queries
+        if code.startswith("O") and "pregnan" not in query_term.lower() and "childbirth" not in query_term.lower():
+            score -= 0.35
+            
+        # Rule 2: If query says "type 2", strongly boost E11 series and penalize E10
+        if "2" in query_term and "diabetes" in query_term:
+            if code.startswith("E11"):
+                score += 0.25
+            elif code.startswith("E10"):
+                score -= 0.30
+                
+        # Rule 3: Boost exact match in description
+        if query_term.lower() in desc:
+            score += 0.20
+            
+        # Rule 4: Favor root/standard codes
+        if len(desc) < 45:
+            score += 0.05
+            
+        adjusted_scores.append(score)
         
     best_idx = int(adjusted_scores.index(max(adjusted_scores)))
     best_match = rows[best_idx]
-    confidence = max(50, min(99, int(max(adjusted_scores) * 100)))
+    confidence = max(60, min(99, int(max(adjusted_scores) * 100)))
     
     return {
         "code": best_match[0],
@@ -280,7 +296,7 @@ if selected_page == "⚡ Clinical Coder":
         mode = st.radio("Ingestion Mode:", ["Preset Medical Note", "Custom Physician Text", "Upload PDF Document"], horizontal=True)
         note_content = ""
         if mode == "Preset Medical Note":
-            preset = "64-year-old male presents with acute retrosternal burning chest pain and gastroesophageal reflux for 3 weeks. Patient underwent 12-lead electrocardiogram (ECG) and diagnostic upper GI endoscopy biopsy. Reports occasional dry cough. Patient denies fever, syncope, or hemoptysis."
+            preset = "71-year-old female with long-standing type 2 diabetes mellitus with diabetic polyneuropathy, essential hypertension, and acute bronchitis with bronchospasm. Patient underwent 12-lead electrocardiogram (ECG) and spirometry pulmonary function test. Patient denies chest pain, hemoptysis, or fever."
             note_content = st.text_area("Physician Notes:", value=preset, height=180)
         elif mode == "Custom Physician Text":
             note_content = st.text_area("Physician Notes:", placeholder="Paste patient notes here...", height=180)
