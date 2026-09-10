@@ -88,59 +88,70 @@ NON_CLINICAL_STOPWORDS = {
 }
 NEGATION_TRIGGERS = ["no", "not", "denies", "without", "absent", "negative for", "ruled out", "free of"]
 
+# --- 1. Numbers Retain Panra Clean Function ---
 def clean_entity_text(phrase):
     phrase = re.sub(r"\b\d+[- ]*(year|yr)[- ]*old\b", "", phrase, flags=re.IGNORECASE)
-    phrase = re.sub(r"[^a-zA-Z\s]", " ", phrase)
-    words = [w.lower() for w in phrase.split() if w.lower() not in NON_CLINICAL_STOPWORDS and len(w) > 2]
+    phrase = re.sub(r"[^a-zA-Z0-9\s]", " ", phrase)
+    words = [w.lower() for w in phrase.split() if w.lower() not in NON_CLINICAL_STOPWORDS and len(w) > 1]
     return " ".join(words).strip()
 
+# --- 2. Procedures ICD-kulla Leak Aagadha Parser ---
 def parse_clinical_doc(text):
     doc = nlp(text)
     pos_findings, neg_findings, procedures = [], [], []
+    
+    all_proc_keywords = set()
+    for proc in CPT_PROCEDURE_REGISTRY:
+        all_proc_keywords.update([kw.lower() for kw in proc["keywords"]])
+        all_proc_keywords.add(proc["description"].lower())
+    
     for sent in doc.sents:
         sent_lower = sent.text.lower()
         has_neg = any(re.search(rf"\b{neg}\b", sent_lower) for neg in NEGATION_TRIGGERS)
+        
         for proc in CPT_PROCEDURE_REGISTRY:
             if any(re.search(rf"\b{kw}\b", sent_lower) for kw in proc["keywords"]):
                 procedures.append(proc["cpt_code"])
+                
         for chunk in sent.noun_chunks:
             cleaned = clean_entity_text(chunk.text)
             if cleaned and len(cleaned) > 2:
+                is_proc = any(kw in cleaned.lower() for kw in all_proc_keywords) or any(p in cleaned.lower() for p in ["ecg", "ekg", "spirometry", "biopsy", "endoscopy"])
+                if is_proc:
+                    continue
+                    
                 if has_neg:
                     neg_findings.append(cleaned)
                 else:
                     pos_findings.append(cleaned)
+                    
     return [e for e in dict.fromkeys(pos_findings) if e not in neg_findings], list(dict.fromkeys(neg_findings)), list(dict.fromkeys(procedures))
 
-# --- High-Precision Hybrid Semantic Search Across 98,505 Codes ---
+# --- 3. Exact Code Priority Hybrid Search ---
 def search_hybrid_icd(query_term, top_candidates=35):
     cursor = db_conn.cursor()
-    tokens = [re.sub(r"[^\w]", "", t) for t in query_term.split() if len(t) > 2]
+    tokens = [re.sub(r"[^\w]", "", t) for t in query_term.split() if len(t) > 1]
     if not tokens:
         return None
         
-    # 1. Exact Full Phrase Search
-    exact_phrase = f'"{query_term}"'
     try:
-        cursor.execute("SELECT icd10_code, full_description, category, chapter FROM icd10_fts WHERE icd10_fts MATCH ? LIMIT ?", (exact_phrase, top_candidates))
+        cursor.execute("SELECT icd10_code, full_description, category, chapter FROM icd10_fts WHERE full_description MATCH ? LIMIT ?", (f'"{query_term}"', top_candidates))
         rows = cursor.fetchall()
     except Exception:
         rows = []
         
-    # 2. Strict AND Search (all tokens must match)
     if not rows:
-        fts_and_query = " AND ".join([f'"{t}"*' for t in tokens])
+        fts_and = " AND ".join([f'"{t}"*' for t in tokens])
         try:
-            cursor.execute("SELECT icd10_code, full_description, category, chapter FROM icd10_fts WHERE icd10_fts MATCH ? LIMIT ?", (fts_and_query, top_candidates))
+            cursor.execute("SELECT icd10_code, full_description, category, chapter FROM icd10_fts WHERE full_description MATCH ? LIMIT ?", (fts_and, top_candidates))
             rows = cursor.fetchall()
         except Exception:
             rows = []
 
-    # 3. Fallback OR Search
     if not rows:
-        fts_or_query = " OR ".join([f'"{t}"*' for t in tokens])
+        fts_or = " OR ".join([f'"{t}"*' for t in tokens])
         try:
-            cursor.execute("SELECT icd10_code, full_description, category, chapter FROM icd10_fts WHERE icd10_fts MATCH ? LIMIT ?", (fts_or_query, top_candidates))
+            cursor.execute("SELECT icd10_code, full_description, category, chapter FROM icd10_fts WHERE full_description MATCH ? LIMIT ?", (fts_or, top_candidates))
             rows = cursor.fetchall()
         except Exception:
             rows = []
@@ -148,16 +159,23 @@ def search_hybrid_icd(query_term, top_candidates=35):
     if not rows:
         return None
         
-    # Semantic Cross-Encoder Reranking
     candidate_texts = [f"{r[1]} {r[2]}" for r in rows]
     query_emb = embedder.encode(query_term, convert_to_tensor=True)
     cand_embs = embedder.encode(candidate_texts, convert_to_tensor=True)
     scores = util.cos_sim(query_emb, cand_embs)[0]
     
-    best_idx = int(scores.argmax())
-    best_score = float(scores[best_idx])
+    adjusted_scores = []
+    for idx, r in enumerate(rows):
+        base_score = float(scores[idx])
+        if r[0].startswith("O") and "childbirth" not in query_term and "pregnan" not in query_term:
+            base_score -= 0.25
+        if query_term.lower() in r[1].lower():
+            base_score += 0.15
+        adjusted_scores.append(base_score)
+        
+    best_idx = int(adjusted_scores.index(max(adjusted_scores)))
     best_match = rows[best_idx]
-    confidence = max(50, min(99, int(best_score * 100)))
+    confidence = max(50, min(99, int(max(adjusted_scores) * 100)))
     
     return {
         "code": best_match[0],
