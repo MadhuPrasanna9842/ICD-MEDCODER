@@ -132,19 +132,12 @@ def search_hybrid_icd(query_term, top_candidates=40):
     if not tokens:
         return None
         
+    fts_and = " AND ".join([f'"{t}"*' for t in tokens])
     try:
-        cursor.execute("SELECT icd10_code, full_description, category, chapter FROM icd10_fts WHERE full_description MATCH ? LIMIT ?", (f'"{query_term}"', top_candidates))
+        cursor.execute("SELECT icd10_code, full_description, category, chapter FROM icd10_fts WHERE full_description MATCH ? LIMIT ?", (fts_and, top_candidates))
         rows = cursor.fetchall()
     except Exception:
         rows = []
-        
-    if not rows:
-        fts_and = " AND ".join([f'"{t}"*' for t in tokens])
-        try:
-            cursor.execute("SELECT icd10_code, full_description, category, chapter FROM icd10_fts WHERE full_description MATCH ? LIMIT ?", (fts_and, top_candidates))
-            rows = cursor.fetchall()
-        except Exception:
-            rows = []
 
     if not rows:
         fts_or = " OR ".join([f'"{t}"*' for t in tokens])
@@ -162,30 +155,33 @@ def search_hybrid_icd(query_term, top_candidates=40):
     cand_embs = embedder.encode(candidate_texts, convert_to_tensor=True)
     scores = util.cos_sim(query_emb, cand_embs)[0]
     
+    clean_query = re.sub(r"[^a-zA-Z0-9\s]", " ", query_term.lower()).split()
+    
     adjusted_scores = []
     for idx, r in enumerate(rows):
         score = float(scores[idx])
         code = r[0]
-        desc = r[1].lower()
+        desc_raw = r[1]
+        desc_clean = re.sub(r"[^a-zA-Z0-9\s]", " ", desc_raw.lower())
         
-        # Rule 1: Heavily penalize Pregnancy/Obstetric codes (O-series) on non-obstetric general queries
-        if code.startswith("O") and "pregnan" not in query_term.lower() and "childbirth" not in query_term.lower():
-            score -= 0.35
+        # Rule 1: Penalty for obstetric codes unless pregnancy is queried
+        if code.startswith("O") and not any(k in query_term.lower() for k in ["pregnan", "childbirth", "puerperium", "postpartum"]):
+            score -= 0.60
             
-        # Rule 2: If query says "type 2", strongly boost E11 series and penalize E10
+        # Rule 2: Type 2 Diabetes priority
         if "2" in query_term and "diabetes" in query_term:
             if code.startswith("E11"):
-                score += 0.25
+                score += 0.35
             elif code.startswith("E10"):
-                score -= 0.30
+                score -= 0.40
                 
-        # Rule 3: Boost exact match in description
-        if query_term.lower() in desc:
-            score += 0.20
+        # Rule 3: Exact token coverage boost (fixes Essential hypertension -> I10)
+        if all(word in desc_clean.split() for word in clean_query):
+            score += 0.30
             
-        # Rule 4: Favor root/standard codes
-        if len(desc) < 45:
-            score += 0.05
+        # Rule 4: Root concise code bonus
+        if len(desc_raw) < 50:
+            score += 0.15
             
         adjusted_scores.append(score)
         
@@ -200,8 +196,7 @@ def search_hybrid_icd(query_term, top_candidates=40):
         "chapter": best_match[3],
         "confidence": confidence
     }
-
-def generate_highlighted_text(text, active_terms, neg_terms, procedures):
+    def generate_highlighted_text(text, active_terms, neg_terms, procedures):
     annotated = text
     for neg in neg_terms:
         annotated = re.compile(re.escape(neg), re.IGNORECASE).sub(f'<span class="hl-neg">❌ {neg}</span>', annotated)
